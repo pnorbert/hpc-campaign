@@ -1,0 +1,33 @@
+version: v0.1
+OLCF:
+    dtn:
+        serverpath: /ccs/home/mememe/work/adios2-install/dtn/bin/adios2_remote_server
+        args: -background -report_port_selection -v -l /ccs/home/mememe/log.adios2_remote_server
+        host: dtn.olcf.ornl.gov 
+        authentication: passcode
+        user: mememe
+        protocol: ssh
+    frontier:
+        serverpath: /ccs/home/mememe/work/adios2-install/frontier/bin/adios2_remote_server
+        args: -background -report_port_selection -v
+        host: frontier.olcf.ornl.gov 
+        authentication: passcode
+        user: mememe
+        protocol: ssh
+
+TEST1:
+    service_1:
+        serverpath: /data/home/aquipper/work/adios2-install/bin/adios2_remote_server
+        args: -v -background -report_port_selection
+        host: quipper.bmi.stonybrook.edu
+        authentication: passcode
+        user: aquipper
+        protocol: ssh
+
+TEST2:
+    service_3:
+        host: quipper3.bmi.stonybrook.edu
+        port: 443
+        authentication: password
+        protocol: ssh
+        local_port: 23900
