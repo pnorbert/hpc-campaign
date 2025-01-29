@@ -85,9 +85,10 @@ class Key:
             self.salt = None
 
 
-    def get_decrypted_key(self) -> bytes:
+    def get_decrypted_key(self, pwd: bytes=None) -> bytes:
         if self.salt:
-            pwd = bytes(getpass("Password: "), 'utf-8')
+            if not pwd:
+                pwd = bytes(getpass("Password: "), 'utf-8')
             kdf = nacl.pwhash.argon2i.kdf
             pkey = kdf(nacl.secret.SecretBox.KEY_SIZE, pwd, self.salt,
                             opslimit=nacl.pwhash.argon2i.OPSLIMIT_SENSITIVE, 
