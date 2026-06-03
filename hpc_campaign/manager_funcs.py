@@ -10,6 +10,7 @@
 import argparse
 import csv
 import glob
+import io
 import json
 import re
 import sqlite3
@@ -21,17 +22,23 @@ from io import BytesIO
 from os import chdir, getcwd, remove, stat
 from os.path import basename, exists, isdir, join
 from pathlib import Path
+from shutil import rmtree
 from socket import getfqdn
 from time import sleep, time_ns
 
 import adios2  # type: ignore[import-untyped]
 import nacl.secret
 import nacl.utils
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 from .config import ACA_VERSION
-from .hdf5_metadata import copy_hdf5_file_without_data, is_hdf5_dataset
-from .taridx import TARTYPES
+from .hdf5_metadata import (
+    copy_hdf5_file_without_data, 
+    is_hdf5_dataset, 
+    copy_hdf5_file_without_data_from_tar,
+)
+from .taridx import TARIDX_VERSION
+from .types import DatasetType
 from .utils import (
     CURRENT_TIME,
     get_folder_size,
@@ -843,6 +850,35 @@ def process_text_files(
             filename_as_recorded = str(getattr(args, "filename_as_recorded", "") or basename(entry))
             add_file_to_archive(args, entry, cur, rep_id, ct, filename_as_recorded)
 
+def process_text_file_data(
+    args: argparse.Namespace,
+    cur: sqlite3.Cursor,
+    host_id: int,
+    dir_id: int,
+    key_id: int,
+    dirpath: str,
+    location: str,
+    text_bytes: bytes,
+) -> tuple[int, int]:
+    if args.name is not None:
+        entry = args.name
+        unique_id = uuid.uuid3(uuid.NAMESPACE_URL, location + "/" + entry).hex
+    else:
+        checksum = sha1(text_bytes).hexdigest()
+        unique_id = uuid.uuid5(uuid.NAMESPACE_OID, checksum).hex
+        entry = f"memory-text/{unique_id[:12]}"
+    print(f"Process entry {entry}:")
+    filesize = len(text_bytes)
+    mt = getattr(args, "mt", 0)
+    if mt == 0:
+        mt = time_ns()
+    archive_id = getattr(args, "archive_id", 0)
+    unique_id = uuid.uuid3(uuid.NAMESPACE_URL, location + "/" + entry).hex
+    ds_id = add_dataset_to_archive(entry, cur, unique_id, "TEXT", mt)
+    rep_id = add_replica_to_archive(host_id, dir_id, archive_id, key_id, entry, cur, ds_id, mt, filesize, indent="  ")
+    if args.store:
+        add_file_to_archive(args, entry, cur, rep_id, mt, basename(entry), content=text_bytes)
+    return ds_id, rep_id
 
 def process_image(
     args: argparse.Namespace,
@@ -852,7 +888,7 @@ def process_image(
     key_id: int,
     dirpath: str,
     location: str,
-):
+)-> tuple[int, int]:
     dataset = args.file
     if args.name is not None:
         dataset = args.name
@@ -929,7 +965,7 @@ def process_image(
             )
             add_resolution_to_archive(thumb_rep_id, imgres[0], imgres[1], cur, indent="  ", verbose=verbose)
             remove(thumbfilename)
-
+    return ds_id, rep_id
 
 def process_image_data(
     args: argparse.Namespace,
@@ -939,13 +975,11 @@ def process_image_data(
     key_id: int,
     dirpath: str,
     location: str,
-):
+) -> tuple[int, int]:
     image_bytes = bytes(args.image_data)
     image_format = str(args.image_format or "").strip()
     if not image_format:
         raise ValueError("image_data requires image_format")
-    if not getattr(args, "store", True):
-        raise ValueError("image_data requires store=True because in-memory images have no external replica path")
 
     suffix = "." + image_format.lower().lstrip(".")
     if args.name is not None:
@@ -958,7 +992,10 @@ def process_image_data(
 
     replica_name = getattr(args, "replica_name", "") or join("memory-images", f"{unique_id}{suffix}")
 
-    mt = time_ns()
+    mt = getattr(args, "mt", 0)
+    if mt == 0:
+        mt = time_ns()
+    archive_id = getattr(args, "archive_id", 0)
     filesize = len(image_bytes)
     verbose = is_verbose(args)
     if verbose:
@@ -972,7 +1009,7 @@ def process_image_data(
     rep_id = add_replica_to_archive(
         host_id,
         dir_id,
-        0,
+        archive_id,
         key_id,
         replica_name,
         cur,
@@ -985,7 +1022,8 @@ def process_image_data(
     add_resolution_to_archive(rep_id, imgres[0], imgres[1], cur, indent="  ", verbose=verbose)
 
     resname = f"{imgres[0]}x{imgres[1]}{suffix}"
-    add_file_to_archive(args, "", cur, rep_id, mt, resname, compress=False, content=image_bytes, indent="  ")
+    if args.store:
+        add_file_to_archive(args, "", cur, rep_id, mt, resname, compress=False, content=image_bytes, indent="  ")
 
     if args.thumbnail is not None:
         if verbose:
@@ -1023,6 +1061,7 @@ def process_image_data(
             indent="  ",
         )
         add_resolution_to_archive(thumb_rep_id, thumb_res[0], thumb_res[1], cur, indent="  ", verbose=verbose)
+    return ds_id, rep_id
 
 
 def process_scalar_field_data(
@@ -1095,7 +1134,7 @@ def process_scalar_field_data(
     add_file_to_archive(args, "", cur, rep_id, mt, resname, compress=False, content=payload, indent="  ")
 
 
-def add_image_data(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.Connection):
+def add_image_data(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.Connection) -> tuple[int, int]:
     long_host_name, short_host_name = get_host_name(args)
     verbose = is_verbose(args)
 
@@ -1105,8 +1144,9 @@ def add_image_data(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.C
     dir_id = add_directory(host_id, rootdir, cur, verbose=verbose)
     sql_commit(con)
 
-    process_image_data(args, cur, host_id, dir_id, key_id, long_host_name + rootdir, rootdir)
+    ds_id, rep_id = process_image_data(args, cur, host_id, dir_id, key_id, long_host_name + rootdir, rootdir)
     sql_commit(con)
+    return ds_id, rep_id
 
 
 def add_scalar_field_data(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.Connection):
@@ -1475,9 +1515,53 @@ def archive_idx_replica(
             )
         sql_commit(con)
 
+def archive_idx_replica2(
+    archived_replica_id: int,
+    archive_id: int,
+    entries: dict[str, list[int]],
+    cur: sqlite3.Cursor,
+    con: sqlite3.Connection,
+    indent: str = "",
+):
+    if archived_replica_id > 0:
+        for fname, entry_info in entries.items():
+            # add replica and register offsets
+            offset = entry_info[0]
+            data_offset = entry_info[1]
+            size = entry_info[2]
+            sql_execute(
+                cur,
+                "insert into archiveidx (archiveid, replicaid, filename, offset, offset_data, size)"
+                " values  (?, ?, ?, ?, ?, ?) "
+                "on conflict (archiveid, replicaid, filename) do update "
+                "set offset = excluded.offset, offset_data = excluded.offset_data, size = excluded.size",
+                (archive_id, archived_replica_id, fname, offset, data_offset, size),
+            )
+        sql_commit(con)
+
+
+def get_image_format(obj: bytes) -> str | None:
+    try:
+        with Image.open(BytesIO(obj)) as img:
+            img.verify()   # validates image structure
+            return img.format
+    except UnidentifiedImageError:
+        return None
+    except OSError:
+        return None
+
+def _build_command_args(args, command: str, updates: dict | None = None) -> argparse.Namespace:
+    cmd_args = argparse.Namespace(**vars(args))
+    cmd_args.command = command
+    if updates:
+        for key, value in updates.items():
+            setattr(cmd_args, key, value)
+    return cmd_args
 
 def archive_idx(
     args: argparse.Namespace,
+    host_id: int,
+    dir_id: int, 
     archive_id: int,
     cur: sqlite3.Cursor,
     con: sqlite3.Connection,
@@ -1487,6 +1571,17 @@ def archive_idx(
         # pylint: disable=consider-using-with
         csvfile = open(args.tarfileidx, newline="", encoding="utf8")
         reader = csv.reader(csvfile)
+        # first row: version
+        row = next(reader, None)
+        if row is None:
+            raise RuntimeError(f"File '{args.tarfileidx}' has no content")
+        id = row[0].strip()
+        version = int(row[1].strip())
+        if version != TARIDX_VERSION:
+            raise RuntimeError(f"File '{args.tarfileidx}' version must be {TARIDX_VERSION}")
+        # second row: columns, ignore
+        next(reader, None)
+
     except FileNotFoundError:
         raise FileNotFoundError(f"File '{args.tarfileidx}' not found.") from None
     except Exception as e:
@@ -1498,12 +1593,24 @@ def archive_idx(
     if len(rows) == 0:
         raise LookupError(f"Archive ID not found: {archive_id}")
 
-    dir_id: int = rows[0][0]
+    # dir_id: int = rows[0][0]
     tarname: str = rows[0][1]
     if not tarname:
         raise LookupError(f"Directory.Archive {dir_id}.{archive_id} is not a TAR archive.")
 
+    local_tar = False
+    if args.system.lower() == "fs":
+        try:
+            # pylint: disable=consider-using-with
+            tf = open(args.tarfilename, "rb")
+            local_tar = True
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            raise EnvironmentError(f"Error occurred when opening '{args.tarfilename}': {e}") from e
+
     line_number = 0
+    key_id = 0 # we don't have encryption yet
     readnext = True
     while True:
         if readnext:
@@ -1516,19 +1623,18 @@ def archive_idx(
             break
 
         # print(f"{line_number}: {row}")
-        if len(row) != 5:
+        if len(row) != 6:
             print(
                 f"{indent}  Warning: Line {line_number} in {args.tarfileidx} does not have 5 elements. "
                 f"Found {len(row)}. Skip."
             )
             continue
-        entrytype = int(row[0].strip())
-        if entrytype not in (0, 5):  # process only Regular and Directory entries
-            continue
+        entrytype = DatasetType(int(row[0].strip()))
         offset = int(row[1].strip())
         data_offset = int(row[2].strip())
         size = int(row[3].strip())
-        archivename = row[4].strip()
+        mt = int(row[4].strip())
+        archivename = row[5].strip()
 
         # find (first non-deleted) replica of dataset that matches the name
         res = sql_execute(
@@ -1537,29 +1643,215 @@ def archive_idx(
         )
         replica_row = res.fetchone()
         if replica_row is None:
-            if args.verbose:
-                print(f"{indent}  No suitable replica of {archivename} found. Skip")
-            continue
-        replica_id: int = replica_row[0]
-        replica_dataset_id: int = replica_row[1]
-        replica_host_id: int = replica_row[2]
-        replica_dir_id: int = replica_row[3]
-        replica_size: int = replica_row[4]
-        print(f"{indent}Replica id = {replica_id} on host {replica_host_id}, dir {replica_dir_id}")
+            if not local_tar:
+                if args.verbose:
+                    print(f"{indent}  No suitable replica of {archivename} found. Skip")
+                continue
+            #
+            # New dataset from TAR file
+            #
+            if entrytype == DatasetType.HDF5:
+                # This is an HDF5 file
+                print(f"--- HDF5 archivename = {archivename}")
+                mdfilename = "/tmp/md_" + basename(archivename)
+                copy_hdf5_file_without_data_from_tar(tf, data_offset, size, mdfilename)
+                unique_id = uuid.uuid3(uuid.NAMESPACE_URL, args.tarfilename + "/" + archivename).hex
+                ds_id = add_dataset_to_archive(archivename, cur, unique_id, "HDF5", mt)
+                rep_id = add_replica_to_archive(
+                    host_id,
+                    dir_id,
+                    archive_id,
+                    key_id,
+                    archivename,
+                    cur,
+                    ds_id,
+                    mt,
+                    size,
+                    indent="  ",
+                )
+                add_file_to_archive(args, mdfilename, cur, rep_id, mt, basename(archivename))
+                entries: dict = {"": [offset, data_offset, size]}
+                archive_idx_replica2(rep_id, archive_id, entries, cur, con, "    ")
+                remove(mdfilename)
 
-        # find dataset of this replica
-        res = sql_execute(
-            cur,
-            f"select name, fileformat from dataset where rowid = '{replica_dataset_id}'",
-        )
-        dsrow = res.fetchone()
-        dsname = dsrow[0]
-        fileformat: str = dsrow[1]
-        print(f"{indent}  Dataset {replica_dataset_id:<5} {dsname}")
+            elif entrytype == DatasetType.IMAGE:
+                # This is an IMAGE file
+                print(f"--- IMAGE archivename = {archivename}, host = {args.hostname}")
+                tf.seek(data_offset)
+                imgdata = tf.read(size)
+                fmt = get_image_format(imgdata)
+                if fmt is not None:
+                    cmd_args = _build_command_args(args, 
+                        "image_data",
+                        {
+                            "hostname": args.host,
+                            "image_data": bytes(imgdata),
+                            "image_format": fmt,
+                            "name": archivename,
+                            "store": False,
+                            "thumbnail": None,
+                            "replica_name": archivename,
+                            "verbose": args.verbose,
+                            "mt": mt,
+                            "archive_id": archive_id,
+                        },
+                    )
+                    ds_id, rep_id = add_image_data(cmd_args, cur, con)
+                    entries: dict = {"": [offset, data_offset, size]}
+                    archive_idx_replica2(rep_id, archive_id, entries, cur, con, "    ")
+                else:
+                    print(f"    This image cannot be processed by pillow. Skip")
 
-        entries: dict = {"": [offset, data_offset, size]}
-        if entrytype == TARTYPES["reg"]:
-            if size == replica_size:
+            elif entrytype == DatasetType.TEXT:
+                print(f"--- TEXT archivename = {archivename}")
+                # This is handled as a TEXT blob
+                # extract the whole thing first
+                tf.seek(data_offset)
+                textdata = tf.read(size)
+                newargs = args
+                newargs.name = archivename
+                newargs.store = True
+                newargs.archive_id = archive_id
+                newargs.mt = mt
+                ds_id, rep_id = process_text_file_data(newargs, cur, host_id, dir_id, 0, 
+                                                       archivename, archivename, textdata)
+                entries: dict = {"": [offset, data_offset, size]}
+                archive_idx_replica2(rep_id, archive_id, entries, cur, con, "    ")
+
+            elif entrytype == DatasetType.ADIOS or entrytype == DatasetType.ADIOS_Subfile:
+                print(f"--- ADIOS archivename = {archivename}")
+                # it's a directory for ADIOS datasets, process its entries
+                entries: dict = {"": [offset, data_offset, size]}
+                tmpdirname = Path("/tmp/md_" + basename(archivename))
+                rmtree(tmpdirname, ignore_errors=True)
+                tmpdirname.mkdir(parents=True, exist_ok=True)
+                filesize = 0
+                mt_bp = mt
+                while True:
+                    row = next(reader, None)
+                    if row is None:
+                        break
+                    line_number += 1
+                    entrytype = int(row[0].strip())
+                    if entrytype != DatasetType.ADIOS_Subfile:
+                        break
+                    offset = int(row[1].strip())
+                    data_offset = int(row[2].strip())
+                    size = int(row[3].strip())
+                    mt = int(row[4].strip())
+                    entryname: str = row[5].strip()
+                    # fname = entryname[len(archivename) + 1 :]
+                    fname = basename(entryname)
+                    entries[fname] = [offset, data_offset, size]
+                    filesize += size
+                    with open(tmpdirname / fname, "wb") as outf:
+                        tf.seek(data_offset)
+                        data = tf.read(size)
+                        outf.write(data)
+                # we have a row unprocessed or None, skip reading at the beginning of the loop
+                readnext = False
+
+                unique_id = uuid.uuid3(uuid.NAMESPACE_URL, args.tarfilename + "/" + archivename).hex
+                ds_id = add_dataset_to_archive(archivename, cur, unique_id, "ADIOS", mt_bp)
+                rep_id = add_replica_to_archive(
+                    host_id,
+                    dir_id,
+                    archive_id,
+                    key_id,
+                    archivename,
+                    cur,
+                    ds_id,
+                    mt_bp,
+                    filesize,
+                    indent="  ",
+                )
+                archive_idx_replica2(rep_id, archive_id, entries, cur, con, "    ")
+
+                # include in-memory-metadata if possible, 
+                # otherwise include the metadata files from disk
+                include_md_files = False
+                try:
+                    with adios2.FileReader(str(tmpdirname)) as fr:
+                        md = fr.get_metadata()
+                        add_file_to_archive(
+                            args, "", cur, rep_id, mt=mt, filename_as_recorded="metadata", compress=True, content=md
+                        )
+                except ValueError:
+                    include_md_files = True
+                cwd = getcwd()
+                chdir(tmpdirname)
+                files: list[str] = []
+                if include_md_files:
+                    files = glob.glob("*md.*")
+                profile_list = glob.glob("profiling.json")
+                files += profile_list
+                for f in files:
+                    add_file_to_archive(args, f, cur, rep_id)
+                chdir(cwd)
+                rmtree(tmpdirname)
+
+            else:
+                print(f"--- Unknown entry {archivename}. Skip")
+
+        else: 
+            #
+            # Just point to the existing replica
+            #
+            replica_id: int = replica_row[0]
+            replica_dataset_id: int = replica_row[1]
+            replica_host_id: int = replica_row[2]
+            replica_dir_id: int = replica_row[3]
+            replica_size: int = replica_row[4]
+            print(f"{indent}Replica id = {replica_id} on host {replica_host_id}, dir {replica_dir_id}")
+
+            # find dataset of this replica
+            res = sql_execute(
+                cur,
+                f"select name, fileformat from dataset where rowid = '{replica_dataset_id}'",
+            )
+            dsrow = res.fetchone()
+            dsname = dsrow[0]
+            fileformat: str = dsrow[1]
+            print(f"{indent}  Dataset {replica_dataset_id:<5} {dsname}")
+
+            entries: dict = {"": [offset, data_offset, size]}
+            if entrytype in (DatasetType.IMAGE, DatasetType.TEXT, DatasetType.HDF5):
+                if size == replica_size:
+                    archive_idx_replica(
+                        dsname,
+                        dir_id,
+                        archive_id,
+                        replica_id,
+                        entries,
+                        cur,
+                        con,
+                        indent=indent + "  ",
+                    )
+                else:
+                    print(
+                        f"{indent}  The replica size ({replica_size}) does not match the size "
+                        f"in the TAR file ({size}). Skip"
+                    )
+
+            elif entrytype == DatasetType.ADIOS:
+                # it's a directory for ADIOS datasets, process its entries
+                while True:
+                    row = next(reader, None)
+                    if row is None:
+                        break
+                    line_number += 1
+                    entrytype = int(row[0].strip())
+                    if entrytype != DatasetType.ADIOS_Subfile:
+                        break
+                    offset = int(row[1].strip())
+                    data_offset = int(row[2].strip())
+                    size = int(row[3].strip())
+                    entryname: str = row[4].strip()
+                    fname = entryname[len(archivename) + 1 :]
+                    entries[fname] = [offset, data_offset, size]
+
+                # we have a row unprocessed or None, skip reading at the beginning of the loop
+                readnext = False
                 archive_idx_replica(
                     dsname,
                     dir_id,
@@ -1570,43 +1862,9 @@ def archive_idx(
                     con,
                     indent=indent + "  ",
                 )
-            else:
-                print(
-                    f"{indent}  The replica size ({replica_size}) does not match the size "
-                    f"in the TAR file ({size}). Skip"
-                )
-
-        elif entrytype == TARTYPES["dir"] and fileformat == "ADIOS":
-            # it's a directory for ADIOS datasets, process its entries
-            while True:
-                row = next(reader, None)
-                if row is None:
-                    break
-                line_number += 1
-                entrytype = int(row[0].strip())
-                offset = int(row[1].strip())
-                data_offset = int(row[2].strip())
-                size = int(row[3].strip())
-                entryname: str = row[4].strip()
-                if not entryname.startswith(archivename):
-                    break
-                if entrytype == TARTYPES["reg"]:
-                    # a file inside the ADIOS dataset
-                    fname = entryname[len(archivename) + 1 :]
-                    entries[fname] = [offset, data_offset, size]
-            # we have a row unprocessed or None, skip reading at the beginning of the loop
-            readnext = False
-            archive_idx_replica(
-                dsname,
-                dir_id,
-                archive_id,
-                replica_id,
-                entries,
-                cur,
-                con,
-                indent=indent + "  ",
-            )
     csvfile.close()
+    if local_tar and not getattr(tf, "closed", True):
+        tf.close()
 
 
 def check_archival_storage_system_name(system: str):
@@ -1656,18 +1914,19 @@ def add_archival_storage(
             (dir_id, tarname, args.system, notes),
         )
         archive_id = lastrowid_or_zero(cur_archive)
-        sql_commit(con)
 
     if archive_id == 0:
         print("  ERROR: Could not insert information into table 'archive' for some reason")
     elif args.tarfileidx:
-        archive_idx(args, archive_id, cur, con, indent="  ")
+        archive_idx(args, host_id, dir_id, archive_id, cur, con, indent="  ")
+        sql_commit(con)
 
     return host_id, dir_id, archive_id
 
 
 def update(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.Connection):
     long_host_name, short_host_name = get_host_name(args)
+    print(f"---- update() host: {short_host_name}   {long_host_name}")
     verbose = is_verbose(args) if args.command == "image" else True
 
     host_id = add_host_name(long_host_name, short_host_name, cur, verbose=verbose)

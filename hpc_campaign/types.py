@@ -13,6 +13,7 @@ class DatasetType(IntEnum):
     IMAGE = 3
     TEXT = 4
     SCALAR_FIELD = 5
+    ADIOS_Subfile = 100
 
 
 ADIOS_AvailableVariables: TypeAlias = dict[str, dict[str, str]]

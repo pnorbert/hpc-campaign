@@ -5,9 +5,10 @@ try:
 except ImportError:
     __HAVE_H5PY__ = False
 
+import io
 import sys
 from os import stat
-
+from .taridx import TarMemberFile
 
 def _report(operation, key, obj, size):
     type_str = type(obj).__name__.split(".")[-1].lower()
@@ -80,6 +81,28 @@ def copy_hdf5_file_without_data(infilename: str, outfilename: str, log: bool = F
         ):
             walk(in_file, out_file, log=log)
         return stat(infilename).st_size, stat(outfilename).st_size
+    return 0, 0
+
+
+def copy_hdf5_file_without_data_from_tar(tarfile, offset_data: int, size: int, outfilename: str, log: bool = False):
+    """Copy an HDF5 file metadata without writing the array data
+
+    :param tarfile: A tar file already opened with open()
+    :param offset_data: Start data offset of the HDF5 file
+    :param size: Size of the HDF5 file
+    :param outfilename: Output HDF5 path
+    :param log: Whether to print results of operations'
+    :returns: A tuple(original_size, new_size)
+    """
+    if __HAVE_H5PY__:
+        raw = TarMemberFile(tarfile, offset_data, size)
+        fobj = io.BufferedReader(raw)
+        with (
+            h5py.File(fobj, "r") as in_file,
+            h5py.File(outfilename, "w") as out_file,
+        ):
+            walk(in_file, out_file, log=log)
+        return size, stat(outfilename).st_size
     return 0, 0
 
 

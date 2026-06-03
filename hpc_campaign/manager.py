@@ -90,6 +90,7 @@ class Manager:  # pylint: disable=too-many-public-methods
         self.con: sqlite3.Connection
         self.cur: sqlite3.Cursor
         self.connected = False
+        print(f"---- Manager __init__ hostname = {self.args.hostname}")
 
     def _apply_encryption_key(self):
         if self.args.keyfile:
@@ -425,6 +426,8 @@ class Manager:  # pylint: disable=too-many-public-methods
         note: str = "",
     ) -> tuple[int, int, int]:
         check_archival_storage_system_name(system)
+        if not host:
+            host = self.args.hostname
         cmd_args = self._build_command_args(
             "archival_storage",
             {
