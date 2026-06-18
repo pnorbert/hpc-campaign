@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,8 @@ from hpc_campaign.manager_args import ArgParser
 
 repo_root = Path(__file__).resolve().parents[1]
 data_dir = repo_root / "data"
+
+LOGGER = logging.getLogger(__name__)
 
 
 def test_visualization_sequence_single_source(tmp_path: Path):
@@ -393,6 +396,7 @@ def test_visualization_convenience_api_respects_verbose(tmp_path: Path, capsys):
         variables=[{"name": "temp", "role": "primary"}],
     )
     captured = capsys.readouterr()
+    LOGGER.debug(f"test_visualization_convenience_api_respects_verbose (without verbose):\n{captured}")
     assert captured.out == ""
 
     manager.visualization(
@@ -404,6 +408,7 @@ def test_visualization_convenience_api_respects_verbose(tmp_path: Path, capsys):
         verbose=1,
     )
     captured = capsys.readouterr()
+    LOGGER.debug(f"test_visualization_convenience_api_respects_verbose (with verbose):\n{captured}")
     assert "Process image" in captured.out
 
     manager.close()

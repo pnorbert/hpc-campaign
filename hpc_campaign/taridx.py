@@ -34,6 +34,11 @@ def create_tar_index_simple(tarfilename: str, indexfile: str | None):
 
 
 class TarMemberFile(io.RawIOBase):
+    """
+    Custom file object that maps seeks and reads to a starting offset.
+    Used by pillow image reader and h5py HDF5 reader to read directly from a TAR file.
+    """
+
     def __init__(self, f, offset_data, size):
         self._f = f
         self._base = offset_data
@@ -82,13 +87,14 @@ class TarMemberFile(io.RawIOBase):
         # super().close()
         pass
 
-def is_image_tar_member(tarfile:io.BufferedReader, offset_data: int, size:int ):
-    raw = TarMemberFile(tarfile, offset_data, size)
+
+def is_image_tar_member(tarfile_fd: io.BufferedReader, offset_data: int, size: int):
+    raw = TarMemberFile(tarfile_fd, offset_data, size)
     fobj = io.BufferedReader(raw)
 
     try:
         with Image.open(fobj) as img:
-            img.verify()   # validates image structure
+            img.verify()  # validates image structure
             return True, img.format
     except UnidentifiedImageError:
         return False, None
@@ -97,6 +103,9 @@ def is_image_tar_member(tarfile:io.BufferedReader, offset_data: int, size:int ):
     finally:
         fobj.close()
 
+
+# pylint: disable=too-many-locals
+# pylint: disable=too-many-statements
 def create_tar_index(tarfilename: str, indexfile: str | None, verbose: int = 0):
     if indexfile is None:
         indexfile = tarfilename + ".idx"
@@ -104,13 +113,14 @@ def create_tar_index(tarfilename: str, indexfile: str | None, verbose: int = 0):
     with (
         tarfile.open(tarfilename) as tf,
         open(indexfile, "w", encoding="utf-8") as idxf,
-        open(tarfilename, "rb") as tfbin
+        open(tarfilename, "rb") as tfbin,
     ):
         idxf.write(f"TARIDX_VERSION,{TARIDX_VERSION}\n")
         idxf.write("filetype, offset, offset_data, size, mtime, name\n")
         it = iter(tf)
         readnext = True
         filetype = DatasetType.Unknown
+        ti = None
         while True:
             if readnext:
                 ti = next(it, None)
@@ -121,11 +131,13 @@ def create_tar_index(tarfilename: str, indexfile: str | None, verbose: int = 0):
 
             entrytype = int(ti.type)
             if entrytype not in (0, 5):  # process only Regular and Directory entries
-                verbose >= 2 and print(f'Skip: {entrytype},{ti.offset},{ti.offset_data},{ti.size},{ti.mtime}"{ti.name}"\n')
+                if verbose >= 2:
+                    print(f'Skip: {entrytype},{ti.offset},{ti.offset_data},{ti.size},{ti.mtime}"{ti.name}"\n')
                 continue
 
             # What file is is? HDF5, image, ADIOS-BP or something else?
-            verbose >= 3 and print(f'{entrytype},{ti.offset},{ti.offset_data},{ti.size},{ti.mtime},"{ti.name}"')
+            if verbose >= 3:
+                print(f'{entrytype},{ti.offset},{ti.offset_data},{ti.size},{ti.mtime},"{ti.name}"')
             if entrytype == 0:
                 tfbin.seek(ti.offset_data)
                 header = tfbin.read(len(HDF5_HEADER))
@@ -133,7 +145,7 @@ def create_tar_index(tarfilename: str, indexfile: str | None, verbose: int = 0):
                     # This is an HDF5 file
                     filetype = DatasetType.HDF5
                 else:
-                    is_image, fmt = is_image_tar_member(tfbin, ti.offset_data, ti.size)
+                    is_image, _ = is_image_tar_member(tfbin, ti.offset_data, ti.size)
                     if is_image:
                         # This is an IMAGE file
                         filetype = DatasetType.IMAGE
@@ -141,7 +153,8 @@ def create_tar_index(tarfilename: str, indexfile: str | None, verbose: int = 0):
                         # This is handled as a blob (TEXT)
                         filetype = DatasetType.TEXT
 
-                verbose >= 1 and print(f'{filetype.name}: {ti.offset},{ti.offset_data},{ti.size},{ti.mtime},"{ti.name}"')
+                if verbose >= 1:
+                    print(f'{filetype.name}: {ti.offset},{ti.offset_data},{ti.size},{ti.mtime},"{ti.name}"')
                 idxf.write(f'{filetype},{ti.offset},{ti.offset_data},{ti.size},{ti.mtime},"{ti.name}"\n')
             else:
                 # hunting for ADIOS BP directories
@@ -149,45 +162,55 @@ def create_tar_index(tarfilename: str, indexfile: str | None, verbose: int = 0):
                 foundADIOS = False
                 components = [f'{DatasetType.ADIOS},{ti.offset},{ti.offset_data},{ti.size},{ti.mtime},"{ti.name}"\n']
                 score = 0
-                verbose >= 3 and print(f"Process dir: {ti.name}")
+                if verbose >= 3:
+                    print(f"Process dir: {ti.name}")
                 while True:
                     ti = next(it, None)
                     if ti is None:
                         # No more entries
-                        verbose >=3 and print("  no more entries")
+                        if verbose >= 3:
+                            print("  no more entries")
                         break
                     if not ti.name.startswith(dirname):
                         # This is something next, need to remember
-                        verbose >= 3 and print("  ended directory")
+                        if verbose >= 3:
+                            print("  ended directory")
                         break
-                    if ti.type != b'0':
+                    if ti.type != b"0":
                         if foundADIOS:
                             # Something not compatible with ADIOS is in this directory
-                            print(f"Unexpected element: believed that {dirname} was an ADIOS dataset"
-                                  f" but found a non-file element in it: {ti.name}. Skip this.")
+                            print(
+                                f"Unexpected element: believed that {dirname} was an ADIOS dataset"
+                                f" but found a non-file element in it: {ti.name}. Skip this."
+                            )
                             continue
-                        else:
-                            print(f"  incompatible element {ti.type} {ti.name}")
-                            break
-                    if (ti.name.endswith("md.idx") or
-                        ti.name.endswith("md.0") or
-                        ti.name.endswith("mmd.0") or
-                        ti.name.endswith("data.0")
-                        ):
+                        print(f"  incompatible element {int(ti.type)} {ti.name}")
+                        break
+                    if (
+                        ti.name.endswith("md.idx")
+                        or ti.name.endswith("md.0")
+                        or ti.name.endswith("mmd.0")
+                        or ti.name.endswith("data.0")
+                    ):
                         score += 1
-                        verbose >=3 and print(f"score = {score}")
+                        if verbose >= 3:
+                            print(f"score = {score}")
 
                     if score >= 2:
                         foundADIOS = True
 
-                    components.append(f'{DatasetType.ADIOS_Subfile},{ti.offset},{ti.offset_data},{ti.size},{ti.mtime},"{ti.name}"\n')
+                    components.append(
+                        f'{DatasetType.ADIOS_Subfile},{ti.offset},{ti.offset_data},{ti.size},{ti.mtime},"{ti.name}"\n'
+                    )
 
                 # we have an item unprocessed or None, skip reading at the beginning of the loop
                 readnext = False
                 if foundADIOS:
-                    verbose >= 1 and print(f"ADIOS: {dirname}")
+                    if verbose >= 1:
+                        print(f"ADIOS: {dirname}")
                     for c in components:
-                        verbose >= 2 and print(" ", c[:-1])
+                        if verbose >= 2:
+                            print(" ", c[:-1])
                         idxf.write(c)
 
 

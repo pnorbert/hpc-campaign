@@ -8,7 +8,9 @@ except ImportError:
 import io
 import sys
 from os import stat
+
 from .taridx import TarMemberFile
+
 
 def _report(operation, key, obj, size):
     type_str = type(obj).__name__.split(".")[-1].lower()

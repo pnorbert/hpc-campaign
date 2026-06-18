@@ -136,10 +136,11 @@ def test_12_info_api():
         show_deleted=True,
         show_checksum=True,
     )
-    api_output = normalize_info_output(format_info(info_data))
+    info_outputs["api"] = normalize_info_output(format_info(info_data))
     LOGGER.debug(f"test_12_info_api info_outputs:\n{info_outputs}")
     assert "cli" in info_outputs
-    assert api_output == info_outputs["cli"]
+    assert info_outputs["api"]
+    assert info_outputs["api"] == info_outputs["cli"]
 
 
 def test_20_ls_cli():
