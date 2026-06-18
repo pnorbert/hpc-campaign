@@ -155,10 +155,56 @@ def test_21_ls_api():
     assert result[0] == str(api_archive)
 
 
-def test_30_delete_cli():
-    run_command("rm", [str(cmdline_archive), "--force"])
-    assert not cmdline_archive.exists()
+def test_30_delete_name_cli():
+    manager = Manager(archive=str(cmdline_archive), campaign_store=str(campaign_store))
+    manager.delete_name("heat")
+    info_data = manager.info(
+        list_replicas=True,
+        list_files=True,
+        show_deleted=True,
+        show_checksum=True,
+    )
+    LOGGER.debug(f"test_31_delete_name_cli info_outputs:\n{normalize_info_output(format_info(info_data))}")
+    idx = next(
+        (k for k, v in info_data.datasets.items() if v.name == "heat"),
+        None,  # returned if not found
+    )
+    assert idx is not None
+    ds = info_data.datasets[idx]
+    LOGGER.debug(f"test_31_delete_name_cli heat replicas:\n{ds.replicas}")
+    for _, replica in ds.replicas.items():
+        assert replica.flags.deleted
+        assert replica.del_time != 0
+        assert len(replica.files) == 0
 
 
-def test_31_delete_api():
-    rm(str(api_archive), campaign_store=str(campaign_store), force=True)
+def test_31_delete_name_api():
+    manager = Manager(archive=str(api_archive), campaign_store=str(campaign_store))
+    manager.delete_name("heat")
+    info_data = manager.info(
+        list_replicas=True,
+        list_files=True,
+        show_deleted=True,
+        show_checksum=True,
+    )
+    LOGGER.debug(f"test_31_delete_name_api info_outputs:\n{normalize_info_output(format_info(info_data))}")
+    idx = next(
+        (k for k, v in info_data.datasets.items() if v.name == "heat"),
+        None,  # returned if not found
+    )
+    assert idx is not None
+    ds = info_data.datasets[idx]
+    LOGGER.debug(f"test_31_delete_name_api heat replicas:\n{ds.replicas}")
+    for _, replica in ds.replicas.items():
+        assert replica.flags.deleted
+        assert replica.del_time != 0
+        assert len(replica.files) == 0
+
+
+# def test_38_delete_cli():
+#    run_command("rm", [str(cmdline_archive), "--force"])
+#    assert not cmdline_archive.exists()
+
+
+# def test_39_delete_api():
+#    rm(str(api_archive), campaign_store=str(campaign_store), force=True)

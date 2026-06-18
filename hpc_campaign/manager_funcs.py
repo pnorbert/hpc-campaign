@@ -1926,8 +1926,9 @@ def add_archival_storage(
 
     if archive_id == 0:
         print("  ERROR: Could not insert information into table 'archive' for some reason")
-    elif args.tarfileidx:
-        archive_idx(args, host_id, dir_id, archive_id, cur, con, indent="  ")
+    else:
+        if args.tarfileidx:
+            archive_idx(args, host_id, dir_id, archive_id, cur, con, indent="  ")
         sql_commit(con)
 
     return host_id, dir_id, archive_id
@@ -2071,8 +2072,8 @@ def delete_replica(
             cur,
             f"update replica set deltime = {CURRENT_TIME} " + f"where rowid = {repid}",
         )
+    sql_execute(cur, f"delete from repfiles where replicaid = {repid}")
     if delete_empty_dataset:
-        sql_execute(cur, f"delete from repfiles where replicaid = {repid}")
         sql_execute(cur, "delete from file where fileid not in (select fileid from repfiles)")
         delete_dataset_if_empty(args, cur, con, datasetid, indent=indent + "  ")
 
@@ -2106,7 +2107,7 @@ def delete_dataset(
     )
     replicas = res.fetchall()
     for rep in replicas:
-        delete_replica(args, cur, con, rep[0], False)
+        delete_replica(args, cur, con, rep[0], True)
 
 
 def delete(args: argparse.Namespace, cur: sqlite3.Cursor, con: sqlite3.Connection):
