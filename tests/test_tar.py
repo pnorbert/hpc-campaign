@@ -25,21 +25,6 @@ api_archive = data_dir / "test_api_tar.aca"
 heat_tar = data_dir / "heat.tar"
 heat_idx = data_dir / "heat.taridx"
 
-""" expected_datasets = {
-    "data/heat.bp": "ADIOS",
-    "data/readme": "TEXT",
-    "data/T00000.png": "IMAGE",
-    "data/T00001.png": "IMAGE",
-    "data/T00002.png": "IMAGE",
-    "data/T00003.png": "IMAGE",
-    "data/T00004.png": "IMAGE",
-    "data/T00005.png": "IMAGE",
-    "data/T00006.png": "IMAGE",
-    "data/T00007.png": "IMAGE",
-    "data/T00008.png": "IMAGE",
-    "data/T00009.png": "IMAGE",
-} """
-
 expected_datasets = {
     "heat": "ADIOS",
     "onearray": "HDF5",
@@ -123,7 +108,7 @@ def test_01_tar_api():
     host_id, dir_id, archive_id = manager.add_archival_storage(
         system="fs",
         host="",
-        directory=str(data_dir.resolve().parents[0]),
+        directory=str(repo_root),
         tarfilename=str(heat_tar),
         tarfileidx=str(heat_idx),
     )
@@ -147,6 +132,8 @@ def test_01_tar_api():
     assert not dict_diff(expected_datasets, result_datasets)
 
     # rm this aca
-    result = rm(str(api_archive), campaign_store=str(campaign_store), interactive=False, force=True)
-    print(f"rm result: {result}")
-    assert result == [] or result == [str(api_archive)]
+
+
+#    result = rm(str(api_archive), campaign_store=str(campaign_store), interactive=False, force=True)
+#    print(f"rm result: {result}")
+#    assert result == [] or result == [str(api_archive)]

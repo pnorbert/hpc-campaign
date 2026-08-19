@@ -1013,7 +1013,6 @@ def main(args=None, prog=None):
         if parser.args.command in (
             "info",
             "visualization-sequence",
-            "add-archival-storage",
             "archived-replica",
             "time-series",
             "upgrade",

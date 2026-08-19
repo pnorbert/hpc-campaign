@@ -7,30 +7,37 @@ from hpc_campaign.rm import rm
 
 repo_root = Path(__file__).resolve().parents[1]
 campaign_store = repo_root
-data_dir = Path("data")
-
 print(f"campaign_store = {repo_root}")
-print(f"data_dir = {data_dir}")
-
-api_archive = data_dir / "test_tar.aca"
-heat_tar = data_dir / "heat.tar"
-heat_idx = data_dir / "heat.taridx"
+api_archive = "test_tar.aca"  #  will find it in repo_root
+heat_tar = "data/tar/heat.tar"
+heat_idx = "data/tar/heat.taridx"
 
 expected_datasets = {
-    "data/heat.bp": "ADIOS",
-    "data/readme": "TEXT",
-    "data/T00000.png": "IMAGE",
-    "data/T00001.png": "IMAGE",
-    "data/T00002.png": "IMAGE",
-    "data/T00003.png": "IMAGE",
-    "data/T00004.png": "IMAGE",
-    "data/T00005.png": "IMAGE",
-    "data/T00006.png": "IMAGE",
-    "data/T00007.png": "IMAGE",
-    "data/T00008.png": "IMAGE",
-    "data/T00009.png": "IMAGE",
+    "heat": "ADIOS",
+    "onearray": "HDF5",
+    "doc/Read.me": "TEXT",
+    "img/T0.png": "IMAGE",
+    "img/T1.png": "IMAGE",
+    "img/T2.png": "IMAGE",
+    "img/T3.png": "IMAGE",
+    "img/T4.png": "IMAGE",
+    "img/T5.png": "IMAGE",
+    "img/T6.png": "IMAGE",
+    "img/T7.png": "IMAGE",
+    "img/T9.png": "DIFFERENT",
+    "not_in_result": "WHOKNOWS",
 }
 info_outputs: dict[str, str] = {}
+
+
+def print_dict_diff(a: dict[str, str], b: dict[str, str]) -> None:
+    for key in sorted(a.keys() | b.keys()):
+        if key not in a:
+            print(f"  extra  : {key}: {b[key]!r}")
+        elif key not in b:
+            print(f"  missing: {key}: {a[key]!r}")
+        elif a[key] != b[key]:
+            print(f"  differ : {key}: {a[key]!r} -> {b[key]!r}")
 
 
 def main():
@@ -40,7 +47,7 @@ def main():
     host_id, dir_id, archive_id = manager.add_archival_storage(
         system="fs",
         host="",
-        directory=str(data_dir.resolve().parents[0]),
+        directory=str(repo_root),
         tarfilename=str(heat_tar),
         tarfileidx=str(heat_idx),
     )
@@ -56,6 +63,13 @@ def main():
     print(f"ls result: {result}")
     assert len(result) == 1
     assert result[0] == str(api_archive)
+
+    result_datasets = {}
+    for _, ds in info_data.datasets.items():
+        result_datasets[ds.name] = ds.file_format
+
+    print("Expected vs result datasets in campaign file")
+    print_dict_diff(expected_datasets, result_datasets)
 
     # rm this aca
 
