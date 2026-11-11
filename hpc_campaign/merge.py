@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import heapq
 import json
 import sqlite3
 import uuid
@@ -331,14 +332,31 @@ def _history(con: sqlite3.Connection) -> dict[str, dict]:
 
 
 def _state(history: dict[str, dict]) -> dict[tuple[str, str], dict]:
-    state = {}
-    # SQLite insertion order is topological, including imports. Validate parents.
-    seen: set[str] = set()
+    """Reconstruct state in causal order, breaking ties by operation UUID."""
+    children: dict[str, list[str]] = {opid: [] for opid in history}
+    remaining = {}
     for opid, operation in history.items():
-        if not set(json.loads(operation["parents"])).issubset(seen):
-            raise MergeError("Incomplete or unordered causal history")
-        seen.add(opid)
+        parents = set(json.loads(operation["parents"]))
+        if missing := parents - history.keys():
+            raise MergeError(f"Missing parent in causal history: {sorted(missing)}")
+        remaining[opid] = len(parents)
+        for parent in parents:
+            children[parent].append(opid)
+    ready = [opid for opid, count in remaining.items() if count == 0]
+    heapq.heapify(ready)
+    state = {}
+    visited = 0
+    while ready:
+        opid = heapq.heappop(ready)
+        operation = history[opid]
         state[(operation["kind"], operation["object_key"])] = operation
+        visited += 1
+        for child in children[opid]:
+            remaining[child] -= 1
+            if remaining[child] == 0:
+                heapq.heappush(ready, child)
+    if visited != len(history):
+        raise MergeError("Cycle in causal history")
     return state
 
 
@@ -440,11 +458,20 @@ def _apply_state(con: sqlite3.Connection, chosen: dict[tuple[str, str], dict]) -
     replay = initialize_connection(con)
     replay(True)
     try:
+        live_entities = {(op["kind"], op["entity_uuid"]) for op in chosen.values() if op["after_value"] != "null"}
+        # Reserve surviving active IDs before considering any retired mapping.
+        mapping: dict[tuple[str, str], int] = {
+            (kind, entity_uuid): local_id
+            for kind, entity_uuid, local_id in con.execute(
+                "SELECT kind, uuid, local_id FROM entity_identity WHERE active=1"
+            )
+            if (kind, entity_uuid) in live_entities
+        }
         for table in reversed(REFERENCES):
             con.execute(f'DELETE FROM "{table}"')
         con.execute("UPDATE entity_identity SET active=0")
-        mapping: dict[tuple[str, str], int] = {}
         for table in REFERENCES:
+            claimed = {local_id for (kind, _), local_id in mapping.items() if kind == table}
             operations = [op for (kind, _), op in chosen.items() if kind == table and op["after_value"] != "null"]
             for operation in operations:
                 values = json.loads(operation["after_value"])
@@ -461,15 +488,15 @@ def _apply_state(con: sqlite3.Connection, chosen: dict[tuple[str, str], dict]) -
                 existing = con.execute(
                     "SELECT local_id FROM entity_identity WHERE kind=? AND uuid=?", (table, entity_uuid)
                 ).fetchone()
-                # Preserve destination IDs for existing objects. Allocate new IDs
-                # above every historical local ID to avoid collisions on import.
-                rowid = (
-                    existing[0]
-                    if existing and existing[0] is not None
-                    else con.execute(
-                        "SELECT coalesce(max(local_id), 0)+1 FROM entity_identity WHERE kind=?", (table,)
-                    ).fetchone()[0]
-                )
+                rowid = mapping.get((table, entity_uuid))
+                if rowid is None:
+                    # Reuse a retired ID only if no chosen entity claims it.
+                    rowid = existing[0] if existing else None
+                    if rowid is None or rowid in claimed:
+                        rowid = con.execute(
+                            "SELECT coalesce(max(local_id), 0)+1 FROM entity_identity WHERE kind=?", (table,)
+                        ).fetchone()[0]
+                claimed.add(rowid)
                 columns = ["rowid", *values]
                 marks = ",".join("?" for _ in columns)
                 quoted = ",".join(f'"{column}"' for column in columns)

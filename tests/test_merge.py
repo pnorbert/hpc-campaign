@@ -14,7 +14,7 @@ from PIL import Image
 from prov.model import Namespace, ProvDocument
 
 from hpc_campaign.manager import Manager
-from hpc_campaign.merge import MergeError, initialize_connection
+from hpc_campaign.merge import MergeError, _history, _state, initialize_connection
 from hpc_campaign.prov_store import canonical_prov_json
 
 
@@ -92,6 +92,82 @@ def test_capture_rollback_savepoint_rowid_reuse_and_blob(tmp_path):
     assert b.merge(a.args.campaign_file_name, apply=True).applied
     assert b.con.execute("SELECT hostname FROM host").fetchone()[0] == "new"
     assert b.con.execute("SELECT count(*) FROM file").fetchone()[0] == 0
+
+
+def test_merge_retired_rowid_claimed_by_another_entity(tmp_path):
+    a = archive(tmp_path)
+    a.con.execute("INSERT INTO key VALUES ('alpha')")
+    b = fork(a, tmp_path)
+    a.con.execute("DELETE FROM key")
+    b.con.execute("DELETE FROM key")
+    a.con.commit()
+    b.con.commit()
+    # Both forks observe the deletion before reinsertion, so alpha's return
+    # succeeds the local tombstone rather than conflicting with it.
+    assert b.merge(a.args.campaign_file_name, apply=True).applied
+    a.con.execute("INSERT INTO key VALUES ('beta')")
+    b.con.execute("INSERT INTO key VALUES ('alpha')")
+    a.con.execute("INSERT INTO replica(keyid,name) VALUES (1,'uses-beta')")
+    b.con.execute("INSERT INTO replica(keyid,name) VALUES (1,'uses-alpha')")
+    a.con.commit()
+    b.con.commit()
+    assert a.con.execute("SELECT rowid FROM key").fetchone()[0] == 1
+    assert b.con.execute("SELECT rowid FROM key").fetchone()[0] == 1
+
+    preview = a.merge(b.args.campaign_file_name)
+    assert not preview.conflicts
+    assert a.merge(b.args.campaign_file_name, apply=True).applied
+    assert {row[0] for row in a.con.execute("SELECT keyid FROM key")} == {"alpha", "beta"}
+    assert a.con.execute("SELECT rowid FROM key WHERE keyid='beta'").fetchone()[0] == 1
+    assert {
+        tuple(row) for row in a.con.execute("SELECT r.name,k.keyid FROM replica r JOIN key k ON k.rowid=r.keyid")
+    } == {("uses-alpha", "alpha"), ("uses-beta", "beta")}
+    assert (
+        a.con.execute(
+            "SELECT count(*) FROM key JOIN entity_identity i ON i.kind='key' AND i.local_id=key.rowid WHERE i.active=1"
+        ).fetchone()[0]
+        == 2
+    )
+    assert b.merge(a.args.campaign_file_name, apply=True).applied
+    assert a.merge(b.args.campaign_file_name).operations == 0
+
+
+def test_history_state_independent_of_storage_order(tmp_path):
+    a = archive(tmp_path)
+    host(a, "alpha")
+    a.con.execute("UPDATE host SET longhostname='updated'")
+    b = fork(a, tmp_path)
+    host(a, "local")
+    host(b, "remote")
+    # Concurrent equal updates exercise deterministic ordering for one object.
+    for manager in (a, b):
+        manager.con.execute("UPDATE host SET longhostname='converged' WHERE hostname='alpha'")
+    a.con.commit()
+    b.con.commit()
+    assert a.merge(b.args.campaign_file_name, apply=True).applied
+    history = _history(a.con)
+    expected = _state(history)
+    # Rebuild in reverse physical order, including two independent fork tips.
+    rows = a.con.execute("SELECT * FROM change_log ORDER BY rowid DESC").fetchall()
+    a.con.execute("DELETE FROM change_log")
+    a.con.executemany("INSERT INTO change_log VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    a.con.commit()
+    assert _state(_history(a.con)) == expected
+    assert _state(dict(reversed(list(history.items())))) == expected
+    # Exercise snapshot validation as well as state reconstruction.
+    assert a.merge(b.args.campaign_file_name).operations == 0
+
+
+@pytest.mark.parametrize("invalid", ["missing", "cycle"])
+def test_state_rejects_invalid_parent_links(tmp_path, invalid):
+    a = archive(tmp_path)
+    host(a, "alpha")
+    a.con.execute("UPDATE host SET longhostname='updated'")
+    history = _history(a.con)
+    first, last = history
+    history[first]["parents"] = json.dumps(["absent" if invalid == "missing" else last])
+    with pytest.raises(MergeError, match="Missing parent" if invalid == "missing" else "Cycle"):
+        _state(history)
 
 
 def test_concurrent_repeated_value_and_delete_update_conflict(tmp_path):
