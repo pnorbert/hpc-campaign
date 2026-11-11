@@ -6,6 +6,7 @@ connection-local functions, so ordinary sqlite connections fail closed.
 
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
 import heapq
@@ -17,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from time import time_ns
 from typing import Any, Callable
+
+from .utils import get_path, set_default_args_from_config
 
 # Dependency order; every local integer reference is declared here.
 REFERENCES = {
@@ -527,76 +530,179 @@ def merge_archive(destination: sqlite3.Connection, source: str | Path, *, apply:
         origin.execute("BEGIN")
         destination.execute("BEGIN IMMEDIATE" if apply else "BEGIN")
         try:
-            if _check_format(destination) != _check_format(origin):
-                raise MergeError("Campaign identity or baseline differs; upgrade once before copying")
-            for table in REFERENCES:
-                if _columns(destination, table) != _columns(origin, table):
-                    raise MergeError(f"Incompatible schema: {table}")
-            local, remote = _history(destination), _history(origin)
-            _verify_snapshot(destination, local)
-            _verify_snapshot(origin, remote)
-            for opid in local.keys() & remote.keys():
-                if local[opid] != remote[opid]:
-                    raise MergeError("Operation UUID has inconsistent contents")
-            incoming = {key: value for key, value in remote.items() if key not in local}
-            local_only = {key: value for key, value in local.items() if key not in remote}
-            combined = {**local, **incoming}
-            local_state, remote_state = _state(local), _state(remote)
-            _state(combined)
-            chosen = dict(local_state)
-            conflicts = set()
-            for key, operation in remote_state.items():
-                previous = chosen.get(key)
-                if previous is None or previous["uuid"] in _ancestors(combined, operation["uuid"]):
-                    chosen[key] = operation
-                elif operation["uuid"] not in _ancestors(combined, previous["uuid"]):
-                    if previous["after_value"] != operation["after_value"]:
-                        conflicts.add(f"Concurrent changes: {key[0]}/{key[1]}")
-            for incoming_op in incoming.values():
-                for local_op in local_only.values():
-                    if local_op["uuid"] not in _ancestors(combined, incoming_op["uuid"]):
-                        overlap = _groups(incoming_op) & _groups(local_op)
-                        # Equal final row values can safely converge, while aggregate
-                        # edits retain conservative conflict handling.
-                        overlap = {
-                            group
-                            for group in overlap
-                            if group not in {f"{incoming_op['kind']}/{incoming_op['object_key']}"}
-                        }
-                        conflicts.update(f"Concurrent aggregate changes: {group}" for group in overlap)
-            if not conflicts and incoming:
-                rehearsal = sqlite3.connect(":memory:")
-                try:
-                    # A SQL snapshot also supports Python 3.10 and avoids the
-                    # backup API blocking on our own write transaction.
-                    rehearsal.executescript("\n".join(destination.iterdump()))
-                    rehearsal.row_factory = sqlite3.Row
-                    initialize_connection(rehearsal)
-                    _apply_state(rehearsal, chosen)
-                except (sqlite3.Error, ValueError, RuntimeError) as exc:
-                    conflicts.add(f"Combined state is invalid: {exc}")
-                finally:
-                    rehearsal.close()
-            if conflicts:
-                return MergeResult(len(incoming), tuple(sorted(conflicts)))
-            if apply and incoming:
-                _apply_state(destination, chosen)
-                for operation in incoming.values():
-                    destination.execute(
-                        "INSERT OR IGNORE INTO entity_identity VALUES (?, NULL, ?, 0)",
-                        (operation["kind"], operation["entity_uuid"]),
-                    )
-                for operation in incoming.values():
-                    destination.execute(
-                        "INSERT INTO change_log VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", tuple(operation.values())
-                    )
-                parents = {parent for op in combined.values() for parent in json.loads(op["parents"])}
-                destination.execute("DELETE FROM merge_head")
-                destination.executemany(
-                    "INSERT INTO merge_head VALUES (?)", [(key,) for key in combined if key not in parents]
-                )
-            destination.commit()
-            return MergeResult(len(incoming), (), apply)
+            result = _merge_snapshot(destination, origin, apply=apply)
+            if not result.conflicts:
+                destination.commit()
+            return result
         finally:
             if destination.in_transaction:
                 destination.rollback()
+
+
+# pylint: disable=too-many-statements,too-many-locals
+def _merge_snapshot(destination: sqlite3.Connection, origin: sqlite3.Connection, *, apply: bool) -> MergeResult:
+    """Merge open snapshots inside a caller-owned transaction."""
+    if _check_format(destination) != _check_format(origin):
+        raise MergeError("Campaign identity or baseline differs; upgrade once before copying")
+    for table in REFERENCES:
+        if _columns(destination, table) != _columns(origin, table):
+            raise MergeError(f"Incompatible schema: {table}")
+    local, remote = _history(destination), _history(origin)
+    _verify_snapshot(destination, local)
+    _verify_snapshot(origin, remote)
+    for opid in local.keys() & remote.keys():
+        if local[opid] != remote[opid]:
+            raise MergeError("Operation UUID has inconsistent contents")
+    incoming = {key: value for key, value in remote.items() if key not in local}
+    local_only = {key: value for key, value in local.items() if key not in remote}
+    combined = {**local, **incoming}
+    local_state, remote_state = _state(local), _state(remote)
+    _state(combined)
+    chosen = dict(local_state)
+    conflicts = set()
+    for key, operation in remote_state.items():
+        previous = chosen.get(key)
+        if previous is None or previous["uuid"] in _ancestors(combined, operation["uuid"]):
+            chosen[key] = operation
+        elif operation["uuid"] not in _ancestors(combined, previous["uuid"]):
+            if previous["after_value"] != operation["after_value"]:
+                conflicts.add(f"Concurrent changes: {key[0]}/{key[1]}")
+    for incoming_op in incoming.values():
+        for local_op in local_only.values():
+            if local_op["uuid"] not in _ancestors(combined, incoming_op["uuid"]):
+                overlap = _groups(incoming_op) & _groups(local_op)
+                # Equal final row values can safely converge, while aggregate
+                # edits retain conservative conflict handling.
+                overlap = {
+                    group for group in overlap if group not in {f"{incoming_op['kind']}/{incoming_op['object_key']}"}
+                }
+                conflicts.update(f"Concurrent aggregate changes: {group}" for group in overlap)
+    if not conflicts and incoming:
+        rehearsal = sqlite3.connect(":memory:")
+        try:
+            # A SQL snapshot also supports Python 3.10 and avoids the
+            # backup API blocking on our own write transaction.
+            rehearsal.executescript("\n".join(destination.iterdump()))
+            rehearsal.row_factory = sqlite3.Row
+            initialize_connection(rehearsal)
+            _apply_state(rehearsal, chosen)
+        except (sqlite3.Error, ValueError, RuntimeError) as exc:
+            conflicts.add(f"Combined state is invalid: {exc}")
+        finally:
+            rehearsal.close()
+    if conflicts:
+        return MergeResult(len(incoming), tuple(sorted(conflicts)))
+    if apply and incoming:
+        _apply_state(destination, chosen)
+        for operation in incoming.values():
+            destination.execute(
+                "INSERT OR IGNORE INTO entity_identity VALUES (?, NULL, ?, 0)",
+                (operation["kind"], operation["entity_uuid"]),
+            )
+        for operation in incoming.values():
+            destination.execute("INSERT INTO change_log VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", tuple(operation.values()))
+        parents = {parent for op in combined.values() for parent in json.loads(op["parents"])}
+        destination.execute("DELETE FROM merge_head")
+        destination.executemany("INSERT INTO merge_head VALUES (?)", [(key,) for key in combined if key not in parents])
+    return MergeResult(len(incoming), (), apply)
+
+
+def merge_archives(destination: sqlite3.Connection, sources: list[Path], *, apply: bool = True) -> MergeResult:
+    """Combine compatible sources in one transaction, rolling everything back on conflict."""
+    if destination.in_transaction:
+        raise MergeError("Commit or roll back pending edits before merging")
+    operations = 0
+    destination.execute("BEGIN IMMEDIATE")
+    try:
+        for source in sources:
+            with closing(sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)) as origin:
+                origin.row_factory = sqlite3.Row
+                origin.execute("BEGIN")
+                result = _merge_snapshot(destination, origin, apply=True)
+                operations += result.operations
+                if result.conflicts:
+                    return MergeResult(operations, tuple(f"{source}: {item}" for item in result.conflicts))
+        if apply:
+            destination.commit()
+        return MergeResult(operations, (), apply)
+    finally:
+        if destination.in_transaction:
+            destination.rollback()
+
+
+def _empty_fork(destination: sqlite3.Connection, source: Path) -> None:
+    """Create an empty compatible archive, retaining only campaign metadata and schema."""
+    with closing(sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)) as origin:
+        origin.row_factory = sqlite3.Row
+        origin.execute("BEGIN")
+        _check_format(origin)
+        _verify_snapshot(origin, _history(origin))
+        origin.backup(destination)
+    replay = initialize_connection(destination)
+    replay(True)
+    try:
+        for table in reversed(REFERENCES):
+            destination.execute(f'DELETE FROM "{table}"')
+        for table in ("entity_identity", "change_log", "merge_head"):
+            destination.execute(f'DELETE FROM "{table}"')
+        destination.commit()
+    finally:
+        replay(False)
+
+
+def merge(sources: list[Path], destination: Path, *, apply: bool = True) -> MergeResult:
+    """Merge sources into a filesystem destination, creating a compatible empty fork if needed."""
+    if not sources:
+        raise MergeError("At least one source archive is required")
+    exists = destination.exists()
+    uri = destination.resolve().as_uri() + "?mode=rw" if exists else ":memory:"
+    with closing(sqlite3.connect(uri, uri=exists)) as target:
+        target.row_factory = sqlite3.Row
+        initialize_connection(target)
+        if not exists:
+            _empty_fork(target, sources[0])
+        result = merge_archives(target, sources, apply=apply)
+        if not exists and result.applied:
+            # Exclusive creation prevents overwriting an archive created during planning.
+            with destination.open("xb"):
+                pass
+            try:
+                with closing(sqlite3.connect(destination)) as output:
+                    target.backup(output)
+            except BaseException:
+                destination.unlink()
+                raise
+        return result
+
+
+def main(args=None, prog=None):
+    parser = argparse.ArgumentParser(
+        prog=prog,
+        description="Merge SOURCE ... into DESTINATION atomically. All archives must share a campaign and baseline.",
+    )
+    parser.add_argument("sources", nargs="+", metavar="SOURCE", help="Source archives (opened read-only)")
+    parser.add_argument("destination", metavar="DESTINATION", help="Destination archive; created if missing")
+    parser.add_argument("--dry-run", action="store_true", help="Preview without changing or creating the destination")
+    parser.add_argument("-s", "--campaign_store", help="Path to local campaign store", default=None)
+    parser.add_argument("-v", "--verbose", action="count", default=0)
+    options = set_default_args_from_config(parser.parse_args(args))
+
+    def archive_path(name: str) -> Path:
+        path = get_path(name, options.campaign_store)
+        return Path(path if path.endswith(".aca") else path + ".aca")
+
+    try:
+        result = merge(
+            [archive_path(name) for name in options.sources],
+            archive_path(options.destination),
+            apply=not options.dry_run,
+        )
+    except (OSError, sqlite3.Error, MergeError) as exc:
+        parser.exit(1, f"ERROR: {exc}\n")
+    print(result)
+    if result.conflicts:
+        parser.exit(1)
+
+
+if __name__ == "__main__":
+    main()

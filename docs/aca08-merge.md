@@ -25,7 +25,7 @@ metadata. It skips with a clear reason when using an older 0.7-only reader.
 Back up an existing archive, then upgrade it **once before making copies**:
 
 ```sh
-hpc_campaign original.aca upgrade
+hpc_campaign manager original.aca upgrade
 cp original.aca colleague.aca
 ```
 
@@ -33,12 +33,32 @@ Make independent changes through Manager on either copy. Preview the exchange,
 then apply it when the result has no conflicts:
 
 ```sh
-hpc_campaign original.aca merge colleague.aca
-hpc_campaign original.aca merge colleague.aca --apply
+hpc_campaign merge colleague.aca original.aca --dry-run
+hpc_campaign merge colleague.aca original.aca
+
+# Combine two sources into a new or existing destination:
+hpc_campaign merge original.aca colleague.aca combined.aca
 ```
 
-The source argument is a filesystem path. The destination follows the usual
-archive/campaign-store conventions. From Python:
+The final argument is the destination; all preceding arguments are sources.
+Merges apply by default; `--dry-run` previews without changing or creating the
+destination. All sources are opened read-only. Archive names use the usual
+campaign-store conventions and gain `.aca` if omitted; `-s/--campaign_store`
+overrides the configured store, and `./` paths bypass it.
+
+An existing destination retains its own changes and receives all sources in one
+transaction. A conflict or incompatible source rolls back the entire operation.
+A missing destination starts empty with the first source's campaign UUID,
+baseline, schema and archive metadata, then imports all sources. It is only
+created after a successful merge. All inputs must share the campaign UUID and
+baseline; independently created campaigns cannot be combined by this command.
+
+The campaign identity is a random persistent UUID in `campaign_identity.uuid`,
+assigned at creation (or upgrade if absent), rather than a hash of archive contents.
+The separate baseline UUID in `merge_meta.baseline` identifies the initialization
+of merge history. Copying an initialized archive preserves both identifiers.
+
+The Python Manager API retains its preview-by-default behavior. From Python:
 
 ```python
 from hpc_campaign.manager import Manager

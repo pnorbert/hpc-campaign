@@ -434,17 +434,17 @@ def test_key_identity_can_reappear_after_imported_tombstone(tmp_path):
 
 
 def test_cli_preview_and_apply(tmp_path, capsys):
-    from hpc_campaign.manager import main
+    from hpc_campaign.merge import main
 
     a = archive(tmp_path)
     b = fork(a, tmp_path)
     host(b, "from-cli")
     b.con.commit()
-    arguments = ["--campaign_store", str(tmp_path), "a.aca", "merge", b.args.campaign_file_name]
-    main(args=arguments)
+    arguments = ["--campaign_store", str(tmp_path), "b", "a"]
+    main(args=[*arguments, "--dry-run"])
     assert "applied=False" in capsys.readouterr().out
     assert a.con.execute("SELECT count(*) FROM host").fetchone()[0] == 0
-    main(args=[*arguments, "--apply"])
+    main(args=arguments)
     assert "applied=True" in capsys.readouterr().out
     assert a.con.execute("SELECT hostname FROM host").fetchone()[0] == "from-cli"
 
@@ -588,3 +588,70 @@ def test_merge_published_image_movie_and_provenance_payloads(tmp_path):
     provenance_info = next(info for info in a.prov_documents(active=True) if info.document_id == document_id)
     assert provenance_info.sha256 == hashlib.sha256(canonical_prov_json(document).encode("utf-8")).hexdigest()
     assert a.prov_document(document_id) == document
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_cli_multiple_sources_atomic_and_repeatable(tmp_path, existing):
+    from hpc_campaign.merge import main
+
+    a = archive(tmp_path)
+    host(a, "baseline")
+    b = fork(a, tmp_path)
+    c = fork(a, tmp_path, "c.aca") if existing else None
+    host(a, "from-a")
+    host(b, "from-b")
+    if c:
+        host(c, "from-c")
+        c.con.commit()
+    a.con.commit()
+    b.con.commit()
+    source_bytes = [(tmp_path / name).read_bytes() for name in ("a.aca", "b.aca")]
+    arguments = ["-s", str(tmp_path), "a", "b", "c"]
+    before = (tmp_path / "c.aca").read_bytes() if existing else None
+    main(args=[*arguments, "--dry-run"])
+    assert ((tmp_path / "c.aca").read_bytes() if existing else None) == before
+    assert (tmp_path / "c.aca").exists() == existing
+    main(args=arguments)
+    main(args=arguments)
+    with sqlite3.connect(tmp_path / "c.aca") as result:
+        names = {row[0] for row in result.execute("SELECT hostname FROM host")}
+        assert names == {"baseline", "from-a", "from-b"} | ({"from-c"} if existing else set())
+        assert (
+            result.execute("SELECT uuid FROM campaign_identity").fetchone()[0]
+            == a.con.execute("SELECT uuid FROM campaign_identity").fetchone()[0]
+        )
+    assert source_bytes == [(tmp_path / name).read_bytes() for name in ("a.aca", "b.aca")]
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("incompatible", [False, True])
+def test_cli_multiple_sources_failure_leaves_destination_unchanged(tmp_path, existing, incompatible):
+    from hpc_campaign.merge import main
+
+    a = archive(tmp_path)
+    b = archive(tmp_path, "b.aca") if incompatible else fork(a, tmp_path)
+    c = fork(a, tmp_path, "c.aca") if existing else None
+    host(a, "collision")
+    host(b, "collision")
+    a.con.commit()
+    b.con.commit()
+    if c:
+        host(c, "preserved")
+        c.con.commit()
+    before = (tmp_path / "c.aca").read_bytes() if existing else None
+    with pytest.raises(SystemExit) as error:
+        main(args=["-s", str(tmp_path), "a", "b", "c"])
+    assert error.value.code == 1
+    assert (tmp_path / "c.aca").exists() == existing
+    if existing:
+        assert (tmp_path / "c.aca").read_bytes() == before
+
+
+def test_top_level_merge_dispatch(monkeypatch):
+    from hpc_campaign.__main__ import main
+
+    called = []
+    monkeypatch.setattr("sys.argv", ["hpc_campaign", "merge", "A", "B", "C"])
+    monkeypatch.setattr("hpc_campaign.merge.main", lambda **kwargs: called.append(kwargs))
+    main()
+    assert called == [{"args": ["A", "B", "C"], "prog": "hpc_campaign merge"}]

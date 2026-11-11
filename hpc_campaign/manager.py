@@ -1655,7 +1655,6 @@ def main(args=None, prog=None):
             "archived-replica",
             "time-series",
             "upgrade",
-            "merge",
         ):
             create_allowed = False
         if n_cmd == 1:
@@ -1746,8 +1745,6 @@ def main(args=None, prog=None):
             if parser.args.remove:
                 manager.delete_time_series(parser.args.name)
             manager.add_time_series(parser.args.name, parser.args.dataset, parser.args.replace)
-        elif parser.args.command == "merge":
-            print(manager.merge(parser.args.source, apply=parser.args.apply))
         elif parser.args.command == "upgrade":
             manager.upgrade()
         else:

@@ -18,7 +18,6 @@ __accepted_commands__ = [
     "archived-replica",
     "time-series",
     "upgrade",
-    "merge",
 ]
 __accepted_commands_str__ = " | ".join(__accepted_commands__)
 
@@ -447,10 +446,6 @@ One may need to run upgrade several times to reach the newest format.
 """,
         )
         parsers["upgrade"] = parser_upgrade
-        parser_merge = argparse.ArgumentParser(prog=f"{prog} <archive> merge")
-        parser_merge.add_argument("source", help="Source ACA path (opened read-only)")
-        parser_merge.add_argument("--apply", action="store_true", help="Apply a conflict-free merge atomically")
-        parsers["merge"] = parser_merge
         return parsers
 
     def remove_prev_args(self, command: str, args: argparse.Namespace):
